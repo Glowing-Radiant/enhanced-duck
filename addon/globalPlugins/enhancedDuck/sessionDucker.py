@@ -2,13 +2,22 @@
 # Copyright (C) 2026 Enhanced Duck contributors
 # This file is covered by the GNU General Public License.
 
-"""Windows Core Audio session ducking for foreground-window aware modes."""
+"""Windows Core Audio session ducking for foreground-window aware modes.
+
+Ducking decisions are made per *application*, not per raw audio-session process.
+Many apps play audio from a hidden helper/renderer/dependency process rather than
+the process that owns their visible window, so each session's process is resolved
+up its parent chain to the nearest ancestor that owns a top-level window. Sessions
+with no top-level window anywhere in their ancestry are ignored, which keeps the
+active app's own streaming audio from being ducked as if it were a separate app.
+"""
 
 from __future__ import annotations
 
 import os
 from ctypes import (
-	POINTER, byref, c_bool, c_float, c_int, c_uint, c_void_p, c_wchar_p, create_unicode_buffer, windll,
+	POINTER, Structure, WINFUNCTYPE, byref, c_bool, c_float, c_int, c_long, c_size_t, c_uint, c_void_p,
+	c_wchar, c_wchar_p, create_unicode_buffer, sizeof, windll,
 )
 from ctypes.wintypes import DWORD, HWND
 from typing import Dict, Iterable, Optional, Set, Tuple
@@ -37,11 +46,39 @@ _OWN_PID = os.getpid()
 _EXCLUDED_PROCESS_NAMES = frozenset({"audiodg.exe"})
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TH32CS_SNAPPROCESS = 0x00000002
+_INVALID_HANDLE_VALUE = c_void_p(-1).value
 
 eRender = 0
 eMultimedia = 1
 
+# Handle-returning APIs default to a 32-bit ``c_int`` return/argument type, which
+# truncates 64-bit handles on x64. Pin them to pointer width so the values stay
+# intact.
 windll.user32.GetForegroundWindow.restype = c_void_p
+windll.kernel32.OpenProcess.restype = c_void_p
+windll.kernel32.CreateToolhelp32Snapshot.restype = c_void_p
+windll.kernel32.CloseHandle.argtypes = [c_void_p]
+windll.kernel32.CloseHandle.restype = c_bool
+
+
+class _PROCESSENTRY32W(Structure):
+	_fields_ = [
+		("dwSize", DWORD),
+		("cntUsage", DWORD),
+		("th32ProcessID", DWORD),
+		("th32DefaultHeapID", c_size_t),
+		("th32ModuleID", DWORD),
+		("cntThreads", DWORD),
+		("th32ParentProcessID", DWORD),
+		("pcPriClassBase", c_long),
+		("dwFlags", DWORD),
+		("szExeFile", c_wchar * 260),
+	]
+
+
+# BOOL CALLBACK EnumWindowsProc(HWND, LPARAM)
+_WNDENUMPROC = WINFUNCTYPE(c_int, c_void_p, c_void_p)
 
 
 class IAudioSessionManager2(IUnknown):
@@ -173,6 +210,69 @@ def _getProcessName(pid: int) -> str:
 	return name
 
 
+def _getParentPidMap() -> Dict[int, int]:
+	"""Return a ``pid -> parent pid`` map for every running process."""
+	result: Dict[int, int] = {}
+	snapshot = windll.kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+	if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
+		return result
+	try:
+		entry = _PROCESSENTRY32W()
+		entry.dwSize = sizeof(_PROCESSENTRY32W)
+		if not windll.kernel32.Process32FirstW(snapshot, byref(entry)):
+			return result
+		while True:
+			result[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+			if not windll.kernel32.Process32NextW(snapshot, byref(entry)):
+				break
+	finally:
+		windll.kernel32.CloseHandle(snapshot)
+	return result
+
+
+def _getTopLevelWindowPids() -> Set[int]:
+	"""Return the pids that own at least one visible top-level window.
+
+	These are the processes a user thinks of as "applications". Streaming
+	helpers, renderer children and other background workers have no top-level
+	window of their own and are therefore absent from this set.
+	"""
+	pids: Set[int] = set()
+
+	def callback(hwnd, _lparam):
+		if windll.user32.IsWindowVisible(hwnd):
+			pid = DWORD()
+			windll.user32.GetWindowThreadProcessId(HWND(hwnd), byref(pid))
+			if pid.value:
+				pids.add(int(pid.value))
+		return 1
+
+	# Keep a reference to the trampoline alive for the (synchronous) enumeration.
+	proc = _WNDENUMPROC(callback)
+	windll.user32.EnumWindows(proc, 0)
+	return pids
+
+
+def _resolveApplicationPid(
+	pid: Optional[int], topLevelPids: Set[int], parentMap: Dict[int, int]
+) -> Optional[int]:
+	"""Map a process to the application (top-level window) it belongs to.
+
+	Walks up the parent-process chain until it reaches a process that owns a
+	top-level window, so a hidden streaming/renderer child is attributed to the
+	visible application that spawned it. Returns ``None`` for processes with no
+	top-level window anywhere in their ancestry -- those are ignored entirely.
+	"""
+	seen: Set[int] = set()
+	current = pid
+	while current and current not in seen:
+		if current in topLevelPids:
+			return current
+		seen.add(current)
+		current = parentMap.get(current)
+	return None
+
+
 def _getAudioSessionEnumerator() -> IAudioSessionEnumerator:
 	deviceEnumerator = CreateObject(MMDeviceEnumerator, interface=IMMDeviceEnumerator)
 	device = deviceEnumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)
@@ -241,15 +341,30 @@ class FocusAwareSessionDucker:
 				self._schedule()
 
 	def _updateDuckedSessions(self):
-		foregroundPid = _getForegroundPid()
-		currentSessions = {session.key: session for session in iterAudioSessions()}
-		sessionPids = {session.pid for session in currentSessions.values()}
-		targetPids = self._getTargetPids(sessionPids, foregroundPid)
+		# Resolve every player to the top-level application it belongs to, so an
+		# app that streams through a hidden helper process is treated as a single
+		# application together with its window.
+		parentMap = _getParentPidMap()
+		topLevelPids = _getTopLevelWindowPids()
+		foregroundAppPid = _resolveApplicationPid(_getForegroundPid(), topLevelPids, parentMap)
+
+		currentSessions: Dict[Tuple[int, str], AudioSessionVolume] = {}
+		sessionAppPids: Dict[Tuple[int, str], Optional[int]] = {}
+		appPids: Set[int] = set()
+		for session in iterAudioSessions():
+			currentSessions[session.key] = session
+			appPid = _resolveApplicationPid(session.pid, topLevelPids, parentMap)
+			sessionAppPids[session.key] = appPid
+			if appPid is not None:
+				appPids.add(appPid)
+
+		targetAppPids = self._getTargetAppPids(appPids, foregroundAppPid)
 
 		for key, session in currentSessions.items():
+			appPid = sessionAppPids[key]
 			# Keep one uncooperative session from aborting the whole pass.
 			try:
-				if session.pid in targetPids:
+				if appPid is not None and appPid in targetAppPids:
 					self._duckSession(session)
 				elif key in self._duckedSessions:
 					self._restoreSession(session)
@@ -260,16 +375,16 @@ class FocusAwareSessionDucker:
 			self._duckedSessions.discard(staleKey)
 			self._originalVolumes.pop(staleKey, None)
 
-	def _getTargetPids(self, sessionPids: Set[int], foregroundPid: Optional[int]) -> Set[int]:
-		if foregroundPid is None:
+	def _getTargetAppPids(self, appPids: Set[int], foregroundAppPid: Optional[int]) -> Set[int]:
+		if foregroundAppPid is None:
 			return set()
-		# NVDA and non-application processes are already filtered out of the
-		# session list; this is a defensive second guard.
-		duckable = sessionPids - {_OWN_PID}
+		# ``appPids`` already excludes sessions with no top-level window; NVDA is
+		# filtered out of the session list, and this drops it defensively too.
+		duckable = appPids - {_OWN_PID}
 		if self._mode == DUCK_ACTIVE_WINDOWS:
-			return {foregroundPid} & duckable
+			return {foregroundAppPid} & duckable
 		if self._mode == DUCK_INACTIVE_WINDOWS:
-			return duckable - {foregroundPid}
+			return duckable - {foregroundAppPid}
 		return set()
 
 	def _duckSession(self, session: AudioSessionVolume):
