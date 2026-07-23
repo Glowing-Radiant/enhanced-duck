@@ -29,7 +29,7 @@ addon_info = {
 	# Author(s)
 	"addon_author": "Enhanced Duck contributors",
 	# URL for the add-on documentation support
-	"addon_url": None,
+	"addon_url": "https://github.com/Glowing-Radiant/enhanced-duck",
 	# Documentation file name
 	"addon_docFileName": "readme.html",
 	# Minimum NVDA version supported (e.g. "2018.3.0", minor version is optional)
