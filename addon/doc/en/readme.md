@@ -28,6 +28,12 @@ sessions are lowered, and it restores every application's original volume when
 you leave the mode or disable ducking. NVDA's own speech and sounds are never
 lowered.
 
+An application's original volume is remembered per application rather than per
+audio session, so a program that closes and reopens its audio while ducked --
+which browsers do constantly, one session per tab -- is still restored to the
+volume you had set for it, instead of being left quiet in the Windows volume
+mixer.
+
 The mode can also be chosen from NVDA Menu > Preferences > Settings > Audio, in
 the **Audio ducking mode** combo box (the two new entries appear at the end of
 the list). Changing configuration profiles is respected as well.
@@ -39,14 +45,29 @@ adjusts the per-application volume that Windows exposes in its volume mixer, so
 ducking works independently of NVDA's built-in WASAPI ducking and does not
 require an installed copy or UI access.
 
-Because Windows groups audio by process, keep the following in mind:
+Windows groups audio by process, but the process that plays a sound is often not
+the one that owns the window you focus. Web browsers are the extreme case: a
+Chromium based browser renders its audio in a separate sandboxed service process
+and gives every tab its own renderer, and Firefox spreads audio across content
+processes. The add-on therefore works out which *application* each audio session
+belongs to, by following the session's process up to the window it belongs to,
+and falling back to matching the executable when that link is unusable. All of a
+browser's processes are treated as the one application that its window
+represents, so focusing a browser window affects all of its audio, and audio from
+one of its helper processes is never mistaken for a separate background app.
 
-* An application is only affected while it has an active audio session (that is,
-  while it is actually producing sound).
-* Some applications play audio from a helper process that is different from the
-  focused window (web browsers are a common example). In that case the audio may
-  not be matched to the focused window, and the mode may not behave as expected
-  for that application.
+Keep the following in mind:
+
+* An application is only affected while it has an audio session, that is, from
+  the moment it opens the audio device rather than only while sound is audible.
+* Audio that cannot be traced to any application window is left alone. Sounds
+  played by Windows itself, by the audio engine, and by NVDA are never lowered.
+* If two separate copies of the same program are running with windows of their
+  own, audio from a helper process that cannot be traced to either is attributed
+  to whichever of them is focused, and otherwise left alone.
+* Only the current default playback device is managed. If you change output
+  device while an application is ducked, that application may keep the lowered
+  volume on the old device.
 
 ## Building
 

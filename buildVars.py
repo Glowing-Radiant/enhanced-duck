@@ -25,7 +25,7 @@ addon_info = {
 	# Translators: Long description to be shown for this add-on on add-on information from add-ons manager
 	"addon_description": _("""Extends NVDA audio ducking with focus-aware modes for ducking active or inactive application windows."""),
 	# version
-	"addon_version": "0.1.0",
+	"addon_version": "0.1.1",
 	# Author(s)
 	"addon_author": "Enhanced Duck contributors",
 	# URL for the add-on documentation support
