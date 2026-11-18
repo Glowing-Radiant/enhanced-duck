@@ -27,7 +27,7 @@ addon_info = {
 	# version
 	"addon_version": "0.2.0",
 	# Author(s)
-	"addon_author": "Prateek Kumar",
+	"addon_author": "Prateek Kumar <kumarprateek312@gmail.com>",
 	# URL for the add-on documentation support
 	"addon_url": "https://github.com/Glowing-Radiant/enhanced-duck",
 	# Documentation file name
