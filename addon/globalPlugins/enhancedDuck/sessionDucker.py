@@ -35,6 +35,13 @@ that plain per-session ducking gets wrong, so they are handled explicitly:
   expensive. The process table is now snapshotted at most every few seconds, the
   audio session manager is cached, and volumes are only written when they
   actually need to change.
+
+How far an application is ducked, and how quickly it gets there and comes back,
+are user settings (see ``settings``). A volume therefore does not jump to its new
+value: once the pass above has decided which applications should be ducked, each
+one's volume is moved towards the level it should be at over the configured
+attack or release time, by a faster timer that runs only while something is
+actually moving and only writes to the applications that are moving.
 """
 
 from __future__ import annotations
@@ -54,12 +61,25 @@ from logHandler import log
 from comtypes import CLSCTX_ALL, COMMETHOD, GUID, HRESULT, IUnknown
 from comtypes.client import CreateObject
 
+from .settings import DuckingSettings, getDuckingSettings
+
 
 DUCK_INACTIVE_WINDOWS = 3
 DUCK_ACTIVE_WINDOWS = 4
-# Scalar (0.0 - 1.0) applied to a ducked application's audio session volume.
-DUCKED_VOLUME = 0.2
+
+# How often the set of applications that should be ducked is recomputed.
 POLL_INTERVAL_MS = 300
+
+# While a volume is on its way to a new level, it is updated this often. Only the
+# applications whose volume is actually moving are written to, so these extra
+# ticks cost a couple of COM calls each rather than a full session enumeration.
+# 50 ms is about 20 steps per second, which is smooth to the ear while keeping
+# the shortest useful ramp (a 150 ms attack) to a handful of writes.
+RAMP_INTERVAL_MS = 50
+
+# Volumes are floats, so a level this close to the one being aimed for counts as
+# having arrived; without it a ramp could creep for ever in the last few bits.
+_LEVEL_EPSILON = 0.0005
 
 # Taking a snapshot of every running process is by far the most expensive part of
 # a poll, and with a browser open there are hundreds of them. Parent/child links
@@ -578,21 +598,78 @@ def iterAudioSessions() -> Iterator[AudioSessionVolume]:
 		yield AudioSessionVolume(pid, key, appKey, state, volume)
 
 
+def _rampedLevel(
+	level: float, target: float, original: float, depth: float, elapsed: float, rampTimeMs: int
+) -> float:
+	"""Return ``level`` moved towards ``target`` by one tick's worth of ramp.
+
+	The rate is the whole ducking range -- from the application's own volume down
+	to the ducking depth -- divided by the configured ramp time, so a full duck or
+	release takes exactly that long. Deriving it from the range rather than from
+	the distance still to go keeps the slope constant: a ramp that is interrupted
+	half way (focus bouncing between two applications) turns round at the same
+	rate instead of crawling, and it cannot overshoot, since the target is also
+	the limit.
+
+	``elapsed`` is in seconds, and is measured rather than assumed, so a tick that
+	the main thread served late moves the volume by what that delay was worth
+	instead of stretching the ramp.
+	"""
+	if rampTimeMs <= 0 or elapsed <= 0:
+		return target
+	span = original * (1.0 - depth)
+	if span <= 0:
+		# Nothing to ramp across: a depth of 100% does not duck at all, and an
+		# application already at zero has nothing to lower.
+		return target
+	step = span * (elapsed * 1000.0 / rampTimeMs)
+	if step <= 0:
+		return level
+	if target < level:
+		return max(target, level - step)
+	return min(target, level + step)
+
+
 class FocusAwareSessionDucker:
+	"""Holds every audio session at the volume the current mode asks for.
+
+	A pass over the audio sessions (every ``POLL_INTERVAL_MS``) decides which
+	*applications* should be ducked. Reaching the level each one should be at is a
+	separate job, run on a ``RAMP_INTERVAL_MS`` timer while any volume is still
+	moving, so that ducking and unducking fade over the configured attack and
+	release times rather than stepping.
+	"""
+
 	def __init__(self):
 		self._mode: Optional[int] = None
 		self._callLater = None
 		self._resolver = _ApplicationResolver()
+		self._settings: DuckingSettings = getDuckingSettings()
 		# Keyed by application (see ``AudioSessionVolume.appKey``) rather than by
 		# session, so an application whose sessions are recreated -- the normal
 		# state of affairs for a browser -- is restored to the volume it really
 		# had instead of to whatever it was left at while ducked.
 		self._originalVolumes: Dict[str, float] = {}
-		self._duckedApps: Set[str] = set()
+		# The volume currently written for each application. An entry lives from
+		# the moment an application starts being ducked until it has arrived back
+		# at its original volume, which is also what makes a release ramp survive
+		# the application dropping out of the ducked set.
+		self._levels: Dict[str, float] = {}
+		# Filled in by each pass: the applications that should be ducked, their
+		# sessions, and which of them have a session that is not expired.
+		self._targetAppKeys: Set[str] = set()
+		self._sessionsByApp: Dict[str, List[AudioSessionVolume]] = {}
+		self._audibleApps: Set[str] = set()
+		self._rampInProgress = False
+		self._lastPassTime = 0.0
+		self._lastTickTime = 0.0
 		self._lastForegroundAppPid: Optional[int] = None
 
 	def start(self, mode: int):
 		self._mode = mode
+		self._settings = getDuckingSettings()
+		self._lastPassTime = 0.0
+		self._lastTickTime = time.monotonic()
 		self._schedule(immediate=True)
 
 	def stop(self):
@@ -602,10 +679,9 @@ class FocusAwareSessionDucker:
 		self._lastForegroundAppPid = None
 		_invalidateSessionManager()
 
-	def _schedule(self, immediate: bool = False):
+	def _schedule(self, delayMs: int = POLL_INTERVAL_MS, immediate: bool = False):
 		self._cancelTimer()
-		delay = 0 if immediate else POLL_INTERVAL_MS
-		self._callLater = core.callLater(delay, self._poll)
+		self._callLater = core.callLater(0 if immediate else delayMs, self._poll)
 
 	def _cancelTimer(self):
 		if self._callLater is not None:
@@ -620,12 +696,21 @@ class FocusAwareSessionDucker:
 		if self._mode not in (DUCK_INACTIVE_WINDOWS, DUCK_ACTIVE_WINDOWS):
 			return
 		try:
-			self._updateDuckedSessions()
+			now = time.monotonic()
+			# Deciding what to duck is the expensive half, so it keeps its own
+			# interval even when ramp ticks are running in between. Half a tick of
+			# slack keeps a timer that fires a shade early from pushing the pass
+			# out to the tick after it.
+			if (now - self._lastPassTime) * 1000.0 >= POLL_INTERVAL_MS - RAMP_INTERVAL_MS / 2.0:
+				self._lastPassTime = now
+				self._settings = getDuckingSettings()
+				self._refreshTargets()
+			self._applyLevels(now)
 		except Exception:
 			log.exception("Error while updating Enhanced Duck audio sessions")
 		finally:
 			if self._mode in (DUCK_INACTIVE_WINDOWS, DUCK_ACTIVE_WINDOWS):
-				self._schedule()
+				self._schedule(RAMP_INTERVAL_MS if self._rampInProgress else POLL_INTERVAL_MS)
 
 	def _getForegroundAppPid(self) -> Optional[int]:
 		"""Return the focused application's pid, tolerating focus-less moments.
@@ -649,7 +734,8 @@ class FocusAwareSessionDucker:
 			return None
 		return last
 
-	def _updateDuckedSessions(self):
+	def _refreshTargets(self):
+		"""Work out which applications should be ducked, and where their sessions are."""
 		# Resolve every player to the top-level application it belongs to, so an
 		# app that streams through a hidden helper process is treated as a single
 		# application together with its window.
@@ -660,37 +746,35 @@ class FocusAwareSessionDucker:
 		sessions: List[AudioSessionVolume] = list(iterAudioSessions())
 		sessionAppPids = [resolver.resolve(session.pid, foregroundAppPid) for session in sessions]
 		appPids = {appPid for appPid in sessionAppPids if appPid is not None}
-
 		targetAppPids = self._getTargetAppPids(appPids, foregroundAppPid)
-		# Expired sessions produce no sound, so they never decide what gets
-		# ducked. An application all of whose sessions have expired therefore
-		# drops out of the target set and is restored below, which is the point:
-		# that restore is the last volume Windows will persist for it, and
-		# leaving it at the ducked value is what would make a browser whose
-		# audio service or tab went away come back permanently quiet.
-		targetAppKeys = {
-			session.appKey
-			for session, appPid in zip(sessions, sessionAppPids)
-			if not session.expired and appPid is not None and appPid in targetAppPids
-		}
 
-		for session in sessions:
-			# Keep one uncooperative session from aborting the whole pass.
-			try:
-				if session.appKey in targetAppKeys:
-					# Writing to an expired sibling of a session that is still
-					# playing would only desynchronise the app's mixer slider
-					# from what is audible, so leave those alone.
-					if not session.expired:
-						self._duckSession(session)
-				elif session.appKey in self._duckedApps:
-					self._restoreSession(session)
-			except Exception:
-				log.exception("Enhanced Duck: could not adjust an audio session")
+		sessionsByApp: Dict[str, List[AudioSessionVolume]] = {}
+		audibleApps: Set[str] = set()
+		targetAppKeys: Set[str] = set()
+		for session, appPid in zip(sessions, sessionAppPids):
+			sessionsByApp.setdefault(session.appKey, []).append(session)
+			# Expired sessions produce no sound, so they never decide what gets
+			# ducked. An application all of whose sessions have expired therefore
+			# drops out of the target set and is restored, which is the point:
+			# that restore is the last volume Windows will persist for it, and
+			# leaving it at the ducked value is what would make a browser whose
+			# audio service or tab went away come back permanently quiet.
+			if session.expired:
+				continue
+			audibleApps.add(session.appKey)
+			if appPid is not None and appPid in targetAppPids:
+				targetAppKeys.add(session.appKey)
 
-		for staleKey in self._duckedApps - targetAppKeys:
-			self._duckedApps.discard(staleKey)
-			self._originalVolumes.pop(staleKey, None)
+		self._sessionsByApp = sessionsByApp
+		self._audibleApps = audibleApps
+		self._targetAppKeys = targetAppKeys
+
+		# An application that has no sessions left at all is gone: there is
+		# nothing to write a restore to, and remembering its volume would only
+		# pin a value that no longer means anything.
+		for goneKey in set(self._levels) - set(sessionsByApp):
+			self._levels.pop(goneKey, None)
+			self._originalVolumes.pop(goneKey, None)
 
 	def _getTargetAppPids(self, appPids: Set[int], foregroundAppPid: Optional[int]) -> Set[int]:
 		if foregroundAppPid is None:
@@ -704,35 +788,118 @@ class FocusAwareSessionDucker:
 			return duckable - {foregroundAppPid}
 		return set()
 
-	def _duckSession(self, session: AudioSessionVolume):
-		original = self._originalVolumes.get(session.appKey)
-		if original is None:
-			original = session.getVolume()
-			self._originalVolumes[session.appKey] = original
-		self._duckedApps.add(session.appKey)
-		# Derive the ducked level from the remembered original rather than from
-		# the current volume: a session created while its application is already
-		# ducked starts at the ducked volume, and reading that back as the
-		# original is what used to ratchet browsers down permanently.
-		session.setVolume(min(original, DUCKED_VOLUME))
+	def _applyLevels(self, now: float):
+		"""Move every tracked application one tick closer to the level it should be at."""
+		elapsed = max(0.0, now - self._lastTickTime)
+		self._lastTickTime = now
+		ramping = False
+		for appKey in list(self._levels):
+			# Keep one uncooperative session from aborting the whole tick.
+			try:
+				if self._applyAppLevel(appKey, elapsed):
+					ramping = True
+			except Exception:
+				log.exception("Enhanced Duck: could not adjust an audio session")
+		# Applications that have only just become targets are picked up after the
+		# pass above, so their first move happens on the next tick, one ramp
+		# interval from now. Starting them here instead would hand them the whole
+		# gap since the last tick -- up to a full poll interval -- and a short
+		# attack time would be spent in a single step, which is the jump the
+		# ramp exists to avoid.
+		for appKey in self._targetAppKeys - set(self._levels):
+			try:
+				if self._trackApplication(appKey):
+					ramping = True
+			except Exception:
+				log.exception("Enhanced Duck: could not read an audio session's volume")
+		self._rampInProgress = ramping
 
-	def _restoreSession(self, session: AudioSessionVolume):
-		originalVolume = self._originalVolumes.get(session.appKey)
-		if originalVolume is not None:
-			session.setVolume(originalVolume)
+	def _trackApplication(self, appKey: str) -> bool:
+		"""Start tracking an application at its own volume. Returns whether it has to ramp."""
+		sessions = [session for session in self._sessionsByApp.get(appKey, ()) if not session.expired]
+		if not sessions:
+			return False
+		original = self._originalVolumes.get(appKey)
+		if original is None:
+			original = sessions[0].getVolume()
+			self._originalVolumes[appKey] = original
+		self._levels[appKey] = original
+		return abs(original - self._targetLevel(appKey, original)) > _LEVEL_EPSILON
+
+	def _targetLevel(self, appKey: str, original: float) -> float:
+		"""Return the volume ``appKey`` should end up at.
+
+		The ducked level is relative to the application's own volume, so ducking
+		always quietens by the same proportion instead of pulling an application
+		the user has already turned down back up to a fixed level.
+		"""
+		if appKey in self._targetAppKeys:
+			return original * self._settings.depth
+		return original
+
+	def _applyAppLevel(self, appKey: str, elapsed: float) -> bool:
+		"""Write one tick of ``appKey``'s ramp. Returns whether it is still ramping."""
+		original = self._originalVolumes.get(appKey)
+		if original is None:
+			self._levels.pop(appKey, None)
+			return False
+		ducked = appKey in self._targetAppKeys
+		target = self._targetLevel(appKey, original)
+		level = self._levels[appKey]
+		if not ducked and appKey not in self._audibleApps:
+			# Nothing of this application is playing any more, so there is no fade
+			# for anyone to hear -- and its sessions can vanish at any moment,
+			# which would leave Windows persisting whatever level the ramp had
+			# reached. Go straight back to the original volume.
+			level = target
+		elif abs(level - target) > _LEVEL_EPSILON:
+			rampTimeMs = (
+				self._settings.attackTimeMs if target < level else self._settings.releaseTimeMs
+			)
+			level = _rampedLevel(level, target, original, self._settings.depth, elapsed, rampTimeMs)
+		else:
+			level = target
+		self._levels[appKey] = level
+		for session in self._sessionsByApp.get(appKey, ()):
+			# Writing a ducked level to an expired session would only
+			# desynchronise the application's volume mixer slider from what is
+			# audible. A restore is written to them on purpose: the level they are
+			# left at is the one Windows persists for the application's next run.
+			if session.expired and ducked:
+				continue
+			session.setVolume(level)
+		if abs(level - target) <= _LEVEL_EPSILON:
+			if not ducked:
+				# Back at its own volume and no longer a target: forget it, so
+				# that the next time it is ducked its volume is read afresh.
+				self._levels.pop(appKey, None)
+				self._originalVolumes.pop(appKey, None)
+			return False
+		return True
 
 	def _restoreAll(self):
+		"""Put every tracked application back at its own volume, at once.
+
+		Leaving the mode is not something to fade out of: this also runs when the
+		add-on or NVDA itself is shutting down, and a ramp needs a timer that will
+		not be there. Anything that cannot be written now would be left ducked.
+		"""
 		try:
 			sessions: Iterable[AudioSessionVolume] = list(iterAudioSessions())
 		except Exception:
 			log.exception("Error while restoring Enhanced Duck audio sessions")
 			sessions = ()
 		for session in sessions:
-			if session.appKey not in self._duckedApps:
+			original = self._originalVolumes.get(session.appKey)
+			if original is None:
 				continue
 			try:
-				self._restoreSession(session)
+				session.setVolume(original)
 			except Exception:
 				log.exception("Enhanced Duck: could not restore an audio session")
-		self._duckedApps.clear()
+		self._levels.clear()
 		self._originalVolumes.clear()
+		self._targetAppKeys.clear()
+		self._sessionsByApp = {}
+		self._audibleApps = set()
+		self._rampInProgress = False

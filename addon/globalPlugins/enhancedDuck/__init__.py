@@ -20,6 +20,10 @@ whether the user changes the mode from the Audio settings panel, from the
   routes through the wrapper above.
 * The Audio settings panel's ducking combo box is extended with the two extra
   entries.
+
+How deeply the extra modes duck, and how quickly, is configurable; those
+settings get a category of their own in NVDA's settings dialog (see
+``settings``).
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from .sessionDucker import (
 	DUCK_INACTIVE_WINDOWS,
 	FocusAwareSessionDucker,
 )
+from .settings import EnhancedDuckSettingsPanel, initialiseConfig
 
 
 # Mapping of every selectable mode number to its display label.
@@ -66,6 +71,7 @@ class _PatchState:
 	handlePostConfigProfileSwitch: Callable
 	registeredProfileSwitchHandler: Optional[Callable] = None
 	audioPanelMakeSettings: Optional[Callable] = None
+	settingsPanelAdded: bool = False
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -74,18 +80,42 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def __init__(self):
 		super().__init__()
+		initialiseConfig()
 		self._ducker = FocusAwareSessionDucker()
 		self._patches = _PatchState(
 			setAudioDuckingMode=audioDucking.setAudioDuckingMode,
 			handlePostConfigProfileSwitch=audioDucking.handlePostConfigProfileSwitch,
 		)
 		self._installPatches()
+		self._addSettingsPanel()
 		self._applyConfiguredMode()
 
 	def terminate(self):
 		self._ducker.stop()
+		self._removeSettingsPanel()
 		self._removePatches()
 		super().terminate()
+
+	# --- Settings panel --------------------------------------------------
+
+	def _addSettingsPanel(self):
+		try:
+			from gui.settingsDialogs import NVDASettingsDialog
+			if EnhancedDuckSettingsPanel not in NVDASettingsDialog.categoryClasses:
+				NVDASettingsDialog.categoryClasses.append(EnhancedDuckSettingsPanel)
+			self._patches.settingsPanelAdded = True
+		except Exception:
+			log.exception("Enhanced Duck: could not add the settings panel")
+
+	def _removeSettingsPanel(self):
+		if not self._patches.settingsPanelAdded:
+			return
+		self._patches.settingsPanelAdded = False
+		try:
+			from gui.settingsDialogs import NVDASettingsDialog
+			NVDASettingsDialog.categoryClasses.remove(EnhancedDuckSettingsPanel)
+		except Exception:
+			pass
 
 	# --- Patch management ------------------------------------------------
 

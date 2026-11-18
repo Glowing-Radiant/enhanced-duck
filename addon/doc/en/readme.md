@@ -38,6 +38,36 @@ The mode can also be chosen from NVDA Menu > Preferences > Settings > Audio, in
 the **Audio ducking mode** combo box (the two new entries appear at the end of
 the list). Changing configuration profiles is respected as well.
 
+## Ducking volume and timing
+
+How far the focus-aware modes lower an application, and how quickly, can be set
+in NVDA Menu > Preferences > Settings > **Enhanced Duck**:
+
+* **Ducking depth** is the volume a ducked application is lowered to, as a
+  percentage of the volume that application is set to in the Windows volume
+  mixer. The default is 20%, so an application you have already turned down to
+  half volume is ducked to a tenth: turning something down by hand keeps its
+  relative quiet instead of ducking pulling it up to a fixed level. 100% means
+  no reduction at all.
+* **Attack time** is how long lowering the volume takes, in milliseconds. The
+  default is 150.
+* **Release time** is how long returning to the original volume takes, in
+  milliseconds. The default is 600.
+
+The volume slides between the two levels over those times instead of jumping,
+which is gentler to listen to and makes it clearer which application is being
+ducked. Set a time to 0 for an immediate change, which is how earlier versions
+of the add-on behaved.
+
+Two things are deliberately not faded, because a fade there could leave an
+application quiet for good rather than being heard: leaving the mode (or
+disabling ducking, switching profiles, or exiting NVDA) restores every
+application at once, and so does an application that has stopped playing
+altogether, since the volume its audio session is left at is the one Windows
+remembers for the next time it runs.
+
+Like NVDA's own settings, all three are stored per configuration profile.
+
 ## How the focus-aware modes work
 
 The two extra modes are built on the Windows Core Audio session API. The add-on
