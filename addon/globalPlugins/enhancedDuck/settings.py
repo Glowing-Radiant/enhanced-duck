@@ -2,146 +2,106 @@
 # Copyright (C) 2026 Enhanced Duck contributors
 # This file is covered by the GNU General Public License.
 
-"""Configuration and settings panel for the focus-aware ducking modes.
-
-Three parameters decide what ducking sounds like, and all three are stored in
-NVDA's own configuration, so they can differ per configuration profile:
-
-* the *depth*: the volume a ducked application is lowered to, expressed as a
-  percentage of the volume that application is set to in the Windows volume
-  mixer, so an application the user has already turned down stays relatively
-  quieter rather than being pulled up to a fixed level;
-* the *attack* time: how long lowering the volume to that level takes;
-* the *release* time: how long returning to the original volume takes.
-
-A time of zero means "change the volume at once", which is how the add-on
-behaved before these settings existed.
-"""
+"""Profile configuration shared by the settings panel and keyboard commands."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import config
-from gui import guiHelper, nvdaControls
-from gui.settingsDialogs import SettingsPanel
 from logHandler import log
 
-
-#: The section of NVDA's configuration that holds this add-on's settings.
-CONFIG_SECTION = "enhancedDuck"
-
-#: Volume a ducked application is lowered to, as a percentage of its own volume.
-DEFAULT_DEPTH_PERCENT = 20
-DEFAULT_ATTACK_TIME_MS = 150
-DEFAULT_RELEASE_TIME_MS = 600
-
-MIN_RAMP_TIME_MS = 0
-# Long enough for a deliberately slow fade, short enough that a mistyped value
-# cannot leave an application quiet for what sounds like forever.
-MAX_RAMP_TIME_MS = 5000
-
-confspec = {
-	"duckingDepth": "integer(default={default}, min=0, max=100)".format(default=DEFAULT_DEPTH_PERCENT),
-	"attackTime": "integer(default={default}, min={min}, max={max})".format(
-		default=DEFAULT_ATTACK_TIME_MS, min=MIN_RAMP_TIME_MS, max=MAX_RAMP_TIME_MS
-	),
-	"releaseTime": "integer(default={default}, min={min}, max={max})".format(
-		default=DEFAULT_RELEASE_TIME_MS, min=MIN_RAMP_TIME_MS, max=MAX_RAMP_TIME_MS
-	),
-}
-
-
-def initialiseConfig():
-	"""Add this add-on's section to NVDA's configuration specification."""
-	config.conf.spec[CONFIG_SECTION] = confspec
-
-
-@dataclass(frozen=True)
-class DuckingSettings:
-	#: Scalar (0.0 - 1.0) a ducked application's own volume is multiplied by.
-	depth: float
-	#: Time taken to lower the volume to the ducked level, in milliseconds.
-	attackTimeMs: int
-	#: Time taken to return to the original volume, in milliseconds.
-	releaseTimeMs: int
-
-
-DEFAULT_SETTINGS = DuckingSettings(
-	depth=DEFAULT_DEPTH_PERCENT / 100.0,
-	attackTimeMs=DEFAULT_ATTACK_TIME_MS,
-	releaseTimeMs=DEFAULT_RELEASE_TIME_MS,
+from .modeSettings import DEFAULT_CYCLE_MODES, validateCycleModes
+from .sessionDucker import (
+	AdjustmentSteps,
+	AudioDuckingConfig,
+	DEFAULT_ADJUSTMENT_STEPS,
+	MAX_TRANSITION_TIME_MS,
+	MIN_DEPTH_ADJUSTMENT_STEP,
 )
 
 
-def _clampPercentage(value) -> int:
-	return min(100, max(0, int(value)))
+DEFAULT_DUCKING_CONFIG = AudioDuckingConfig(0.2, 150, 600)
+
+CONFIG_SECTION = "enhancedDuck"
+CONFIG_SPEC = {
+	"duckingDepth": "float(default=20.0, min=0.0, max=100.0)",
+	"attackTime": f"integer(default=150, min=0, max={MAX_TRANSITION_TIME_MS})",
+	"releaseTime": f"integer(default=600, min=0, max={MAX_TRANSITION_TIME_MS})",
+	"depthAdjustmentStep": f"float(default=0.05, min={MIN_DEPTH_ADJUSTMENT_STEP}, max=1.0)",
+	"attackAdjustmentStepMs": f"integer(default=50, min=1, max={MAX_TRANSITION_TIME_MS})",
+	"releaseAdjustmentStepMs": f"integer(default=50, min=1, max={MAX_TRANSITION_TIME_MS})",
+	"includedModes": "int_list(default=list(0, 1, 2, 3, 4))",
+}
 
 
-def _clampRampTime(value) -> int:
-	return min(MAX_RAMP_TIME_MS, max(MIN_RAMP_TIME_MS, int(value)))
+def _registerConfigSpec():
+	config.conf.spec[CONFIG_SECTION] = CONFIG_SPEC
 
 
-def getDuckingSettings() -> DuckingSettings:
-	"""Return the configured ducking parameters.
+def _getProfileValue(section, key, developmentKey):
+	if section.isSet(developmentKey) and not section.isSet(key):
+		return section[developmentKey]
+	return section[key]
 
-	Values are clamped rather than trusted: the configuration file can be edited
-	by hand, and a depth outside 0-100 would be written straight to an audio
-	session's volume. A section that cannot be read at all (a configuration
-	written by a newer version of the add-on, say) falls back to the defaults, so
-	ducking keeps working instead of the mode failing outright.
-	"""
+
+def _readDuckingConfig(
+	fallback: AudioDuckingConfig = DEFAULT_DUCKING_CONFIG,
+) -> AudioDuckingConfig:
+	"""Read and defensively validate the current profile's settings."""
 	try:
 		section = config.conf[CONFIG_SECTION]
-		return DuckingSettings(
-			depth=_clampPercentage(section["duckingDepth"]) / 100.0,
-			attackTimeMs=_clampRampTime(section["attackTime"]),
-			releaseTimeMs=_clampRampTime(section["releaseTime"]),
+		# Existing releases store a percentage. Also accept the scalar and
+		# explicit millisecond keys used by the development builds.
+		if section.isSet("depth") and not section.isSet("duckingDepth"):
+			depth = section["depth"]
+		else:
+			depth = float(section["duckingDepth"]) / 100.0
+		duckingConfig = AudioDuckingConfig.fromValues(
+			depth,
+			_getProfileValue(section, "attackTime", "attackTimeMs"),
+			_getProfileValue(section, "releaseTime", "releaseTimeMs"),
 		)
+		if duckingConfig is not None:
+			return duckingConfig
 	except Exception:
-		log.exception("Enhanced Duck: could not read the ducking settings")
-		return DEFAULT_SETTINGS
+		pass
+	log.warning("Enhanced Duck: invalid configuration; keeping the last safe settings")
+	return fallback
 
 
-class EnhancedDuckSettingsPanel(SettingsPanel):
-	# Translators: The title of the Enhanced Duck category in NVDA's settings dialog.
-	title = _("Enhanced Duck")
+def _readCycleModes(fallback=DEFAULT_CYCLE_MODES):
+	"""Read and defensively validate modes included in the cycle command."""
+	try:
+		includedModes = validateCycleModes(config.conf[CONFIG_SECTION]["includedModes"])
+		if includedModes is not None:
+			return includedModes
+	except Exception:
+		pass
+	log.warning("Enhanced Duck: invalid cycle mode list; keeping the last safe list")
+	return fallback
 
-	def makeSettings(self, settingsSizer):
-		sHelper = guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
-		# Read through the same accessor the ducker uses, so an unreadable
-		# configuration shows the defaults instead of failing to build the panel.
-		current = getDuckingSettings()
 
-		# Translators: The label for a setting in the Enhanced Duck settings panel.
-		depthLabel = _("Ducking &depth, as a percentage of an application's own volume")
-		self.depthSlider = sHelper.addLabeledControl(
-			depthLabel, nvdaControls.EnhancedInputSlider, minValue=0, maxValue=100
-		)
-		self.depthSlider.SetValue(round(current.depth * 100))
-
-		# Translators: The label for a setting in the Enhanced Duck settings panel.
-		attackLabel = _("&Attack time, in milliseconds (time taken to lower the volume)")
-		self.attackEdit = sHelper.addLabeledControl(
-			attackLabel,
-			nvdaControls.SelectOnFocusSpinCtrl,
-			min=MIN_RAMP_TIME_MS,
-			max=MAX_RAMP_TIME_MS,
-			initial=current.attackTimeMs,
-		)
-
-		# Translators: The label for a setting in the Enhanced Duck settings panel.
-		releaseLabel = _("&Release time, in milliseconds (time taken to restore the volume)")
-		self.releaseEdit = sHelper.addLabeledControl(
-			releaseLabel,
-			nvdaControls.SelectOnFocusSpinCtrl,
-			min=MIN_RAMP_TIME_MS,
-			max=MAX_RAMP_TIME_MS,
-			initial=current.releaseTimeMs,
-		)
-
-	def onSave(self):
+def _readAdjustmentSteps(fallback: AdjustmentSteps = DEFAULT_ADJUSTMENT_STEPS) -> AdjustmentSteps:
+	"""Read and defensively validate shortcut step sizes for the current profile."""
+	try:
 		section = config.conf[CONFIG_SECTION]
-		section["duckingDepth"] = _clampPercentage(self.depthSlider.GetValue())
-		section["attackTime"] = _clampRampTime(self.attackEdit.GetValue())
-		section["releaseTime"] = _clampRampTime(self.releaseEdit.GetValue())
+		steps = AdjustmentSteps.fromValues(
+			section["depthAdjustmentStep"],
+			section["attackAdjustmentStepMs"],
+			section["releaseAdjustmentStepMs"],
+		)
+		if steps is not None:
+			return steps
+	except Exception:
+		pass
+	log.warning("Enhanced Duck: invalid adjustment steps; using the safe defaults")
+	return fallback
+
+
+def _writeDuckingConfig(settings: AudioDuckingConfig, previous: AudioDuckingConfig | None = None):
+	section = config.conf[CONFIG_SECTION]
+	if previous is None or settings.depth != previous.depth:
+		section["duckingDepth"] = round(settings.depth * 100, 2)
+	if previous is None or settings.attackTimeMs != previous.attackTimeMs:
+		section["attackTime"] = settings.attackTimeMs
+	if previous is None or settings.releaseTimeMs != previous.releaseTimeMs:
+		section["releaseTime"] = settings.releaseTimeMs
