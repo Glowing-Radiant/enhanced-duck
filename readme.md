@@ -14,8 +14,10 @@ Press `NVDA+shift+d` to cycle through the available ducking modes:
 * Duck inactive applications
 * Duck the active application
 
-The first three are NVDA's standard ducking modes. The last two are added by
-this add-on:
+The first three are NVDA's standard mode selections. Enhanced Duck replaces the
+fixed volume adjustment used by **Duck when outputting speech and sounds** and
+**Always duck**, so the configured volume multiplier, attack time, and release
+time apply to those modes too. The last two modes are added by this add-on:
 
 * **Duck inactive applications** lowers the audio of every application that is
   not currently focused, so the app you are working in stays at full volume.
@@ -28,49 +30,70 @@ sessions are lowered, and it restores every application's original volume when
 you leave the mode or disable ducking. NVDA's own speech and sounds are never
 lowered.
 
-An application's original volume is remembered per application rather than per
-audio session, so a program that closes and reopens its audio while ducked --
-which browsers do constantly, one session per tab -- is still restored to the
-volume you had set for it, instead of being left quiet in the Windows volume
-mixer.
-
 The mode can also be chosen from NVDA Menu > Preferences > Settings > Audio, in
 the **Audio ducking mode** combo box (the two new entries appear at the end of
 the list). Changing configuration profiles is respected as well.
 
-## Ducking volume and timing
+## Ducking settings
 
-How far the focus-aware modes lower an application, and how quickly, can be set
-in NVDA Menu > Preferences > Settings > **Enhanced Duck**:
+Open NVDA Menu > Preferences > Settings > **Enhanced Duck** to configure every
+ducking mode except **No ducking**:
 
-* **Ducking depth** is the volume a ducked application is lowered to, as a
-  percentage of the volume that application is set to in the Windows volume
-  mixer. The default is 20%, so an application you have already turned down to
-  half volume is ducked to a tenth: turning something down by hand keeps its
-  relative quiet instead of ducking pulling it up to a fixed level. 100% means
-  no reduction at all.
-* **Attack time** is how long lowering the volume takes, in milliseconds. The
-  default is 150.
-* **Release time** is how long returning to the original volume takes, in
-  milliseconds. The default is 600.
+* **Ducking volume multiplier** is the fraction of an application's original
+  volume that remains while it is ducked. For example, `0.25` keeps 25 percent
+  of the original volume. Valid values range from `0.00` to `1.00`.
+* **Attack time** is the number of milliseconds used to move from the original
+  volume to the ducked volume.
+* **Release time** is the number of milliseconds used to return to the original
+  volume after ducking ends.
+* **Ducking volume adjustment step** controls how much `NVDA+-` and `NVDA+=`
+  change the multiplier. It may range from `0.0001` to `1.0000`.
+* **Attack adjustment step** and **release adjustment step** control how many
+  milliseconds the corresponding keyboard commands add or subtract. They may
+  range from 1 to 60000 milliseconds.
+* **Modes included when cycling with NVDA+Shift+D** is a checklist controlling
+  which modes the shortcut visits. At least one mode must remain checked.
 
-The volume slides between the two levels over those times instead of jumping,
-which is gentler to listen to and makes it clearer which application is being
-ducked. Set a time to 0 for an immediate change, which is how earlier versions
-of the add-on behaved.
+Attack and release values may range from 0 to 60000 milliseconds. Zero applies
+the change immediately. Non-zero values produce a perceptually even transition,
+and a transition can safely reverse when focus or ducking mode changes partway
+through it. In **Duck when outputting speech and sounds**, the release begins
+when NVDA releases its last output reference. The configured release replaces
+NVDA's fixed one-second hold. Attack runs asynchronously alongside speech and
+sounds. The speech-triggered mode uses NVDA's output notifications and requires
+an NVDA installation with audio ducking support.
 
-Two things are deliberately not faded, because a fade there could leave an
-application quiet for good rather than being heard: leaving the mode (or
-disabling ducking, switching profiles, or exiting NVDA) restores every
-application at once, and so does an application that has stopped playing
-altogether, since the volume its audio session is left at is the one Windows
-remembers for the next time it runs.
+The defaults are a `0.20` multiplier, 150 milliseconds of attack and 600
+milliseconds of release. Settings can vary by NVDA configuration profile.
+Existing profile values are carried forward, including the percentage-based
+depth from version 0.2.0. Invalid configuration-file values fall back to the
+last valid settings or the defaults at startup. All five cycling modes are
+checked by default. If the current mode is not checked, the
+next shortcut press starts at the first checked mode.
 
-Like NVDA's own settings, all three are stored per configuration profile.
+## Keyboard adjustments
+
+The current profile's ducking parameters can be changed without opening
+Settings. Each command announces its new value and retargets active audio
+without restarting the selected ducking mode:
+
+* `NVDA+-` lowers the ducked volume multiplier, making ducking more aggressive.
+* `NVDA+=` raises the ducked volume multiplier, making ducking less aggressive.
+* `NVDA+Ctrl+-` and `NVDA+Ctrl+=` decrease and increase attack time.
+* `NVDA+Alt+-` and `NVDA+Alt+=` decrease and increase release time.
+
+The adjustment steps are configured in the Enhanced Duck settings category.
+Their defaults are 0.05 for volume and 50 ms for both attack and release. The
+commands can be reassigned under **Audio** in NVDA's **Input Gestures** dialog.
+
+The same limits used by the Settings panel are enforced, so repeated key
+presses cannot move volume outside 0.00–1.00 or transition times outside
+0–60000 ms. Rapid key-repeat bursts are coalesced to prevent repeated Core Audio
+discovery while still applying the newest value at the next configuration refresh.
 
 ## How the focus-aware modes work
 
-The two extra modes are built on the Windows Core Audio session API. The add-on
+The focus-aware modes are built on the Windows Core Audio session API. The add-on
 adjusts the per-application volume that Windows exposes in its volume mixer, so
 ducking works independently of NVDA's built-in WASAPI ducking and does not
 require an installed copy or UI access.
@@ -88,8 +111,8 @@ one of its helper processes is never mistaken for a separate background app.
 
 Keep the following in mind:
 
-* An application is only affected while it has an audio session, that is, from
-  the moment it opens the audio device rather than only while sound is audible.
+* The add-on reduces active sessions and restores tracked sessions that become
+  inactive or expire, while Windows still exposes them.
 * Audio that cannot be traced to any application window is left alone. Sounds
   played by Windows itself, by the audio engine, and by NVDA are never lowered.
 * If two separate copies of the same program are running with windows of their
@@ -98,6 +121,22 @@ Keep the following in mind:
 * Only the current default playback device is managed. If you change output
   device while an application is ducked, that application may keep the lowered
   volume on the old device.
+
+Enhanced Duck runs Core Audio discovery and volume updates on a dedicated worker,
+so fade ticks do not occupy NVDA's interface thread. It uses inexpensive
+foreground checks and performs heavier process and session discovery less often.
+Inactive sessions and expired timers are released from tracking. Fades use
+five-millisecond volume updates and a logarithmic, eased curve to soften the
+start and end of each transition. Windows session-volume controls still change
+in discrete steps, so very short fades or large volume changes may remain
+audible; try a longer attack or release time if that happens.
+
+Before reducing an application's session volume, Enhanced Duck saves its
+original value in a small recovery file inside the NVDA configuration folder.
+The entry is removed after restoration. If NVDA or the add-on stops unexpectedly,
+the next start restores any matching sessions before ducking begins again. A
+normal exit or restart also restores volumes without briefly re-enabling NVDA's
+system-wide native ducking effect.
 
 ## Building
 
