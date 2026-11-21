@@ -21,6 +21,7 @@ from .coreAudio import (
 	_OWN_PID,
 	_getForegroundPid,
 	_invalidateSessionManager,
+	getLivePids,
 	iterAudioSessions,
 )
 
@@ -50,6 +51,32 @@ DEFAULT_ATTACK_ADJUSTMENT_STEP_MS = 50
 DEFAULT_RELEASE_ADJUSTMENT_STEP_MS = 50
 
 
+def _validateDuckingValues(depth, attackTimeMs, releaseTimeMs, minDepth, minTimeMs):
+	"""Return the validated triple, or ``None`` for invalid input."""
+	try:
+		if isinstance(depth, bool) or isinstance(attackTimeMs, bool) or isinstance(releaseTimeMs, bool):
+			return None
+		if isinstance(depth, str):
+			# Accept the decimal comma used by many locales in the settings panel
+			# while storing and displaying one scalar representation.
+			depth = depth.strip().replace(",", ".")
+		validatedDepth = float(depth)
+		validatedAttack = int(attackTimeMs)
+		validatedRelease = int(releaseTimeMs)
+		# Do not silently truncate fractional transition times.
+		if float(attackTimeMs) != validatedAttack or float(releaseTimeMs) != validatedRelease:
+			return None
+	except (TypeError, ValueError, OverflowError):
+		return None
+	if not math.isfinite(validatedDepth) or not minDepth <= validatedDepth <= 1.0:
+		return None
+	if not minTimeMs <= validatedAttack <= MAX_TRANSITION_TIME_MS:
+		return None
+	if not minTimeMs <= validatedRelease <= MAX_TRANSITION_TIME_MS:
+		return None
+	return validatedDepth, validatedAttack, validatedRelease
+
+
 @dataclass(frozen=True)
 class AdjustmentSteps:
 	"""Validated step sizes used by the keyboard adjustment commands."""
@@ -60,28 +87,11 @@ class AdjustmentSteps:
 
 	@classmethod
 	def fromValues(cls, depth, attackTimeMs, releaseTimeMs) -> Optional["AdjustmentSteps"]:
-		try:
-			if isinstance(depth, bool) or isinstance(attackTimeMs, bool) or isinstance(releaseTimeMs, bool):
-				return None
-			if isinstance(depth, str):
-				depth = depth.strip().replace(",", ".")
-			validatedDepth = float(depth)
-			validatedAttack = int(attackTimeMs)
-			validatedRelease = int(releaseTimeMs)
-		except (TypeError, ValueError, OverflowError):
-			return None
-		if not math.isfinite(validatedDepth) or not MIN_DEPTH_ADJUSTMENT_STEP <= validatedDepth <= 1.0:
-			return None
-		try:
-			if float(attackTimeMs) != validatedAttack or float(releaseTimeMs) != validatedRelease:
-				return None
-		except (TypeError, ValueError, OverflowError):
-			return None
-		if not 1 <= validatedAttack <= MAX_TRANSITION_TIME_MS:
-			return None
-		if not 1 <= validatedRelease <= MAX_TRANSITION_TIME_MS:
-			return None
-		return cls(validatedDepth, validatedAttack, validatedRelease)
+		# A step of zero would make its keyboard command do nothing.
+		values = _validateDuckingValues(
+			depth, attackTimeMs, releaseTimeMs, MIN_DEPTH_ADJUSTMENT_STEP, 1,
+		)
+		return cls(*values) if values is not None else None
 
 
 DEFAULT_ADJUSTMENT_STEPS = AdjustmentSteps()
@@ -114,34 +124,14 @@ class AudioDuckingConfig:
 	@classmethod
 	def fromValues(cls, depth, attackTimeMs, releaseTimeMs) -> Optional["AudioDuckingConfig"]:
 		"""Return a validated configuration, or ``None`` for invalid input."""
-		try:
-			if isinstance(depth, bool) or isinstance(attackTimeMs, bool) or isinstance(releaseTimeMs, bool):
-				return None
-			if isinstance(depth, str):
-				# Accept the decimal comma used by many locales in the settings
-				# panel while storing and displaying one scalar representation.
-				depth = depth.strip().replace(",", ".")
-			validatedDepth = float(depth)
-			validatedAttack = int(attackTimeMs)
-			validatedRelease = int(releaseTimeMs)
-		except (TypeError, ValueError, OverflowError):
-			return None
-		if not math.isfinite(validatedDepth) or not 0.0 <= validatedDepth <= 1.0:
-			return None
-		# Do not silently truncate fractional transition times.
-		try:
-			if float(attackTimeMs) != validatedAttack or float(releaseTimeMs) != validatedRelease:
-				return None
-		except (TypeError, ValueError, OverflowError):
-			return None
-		if not 0 <= validatedAttack <= MAX_TRANSITION_TIME_MS:
-			return None
-		if not 0 <= validatedRelease <= MAX_TRANSITION_TIME_MS:
-			return None
-		return cls(validatedDepth, validatedAttack, validatedRelease)
+		values = _validateDuckingValues(depth, attackTimeMs, releaseTimeMs, 0.0, 0)
+		return cls(*values) if values is not None else None
 
 
-DEFAULT_DUCKING_CONFIG = AudioDuckingConfig()
+# The engine's own starting point, not the add-on's shipped defaults: those live
+# in settings.DEFAULT_DUCKING_CONFIG and are always passed in by the caller.
+FALLBACK_DUCKING_CONFIG = AudioDuckingConfig()
+
 
 @dataclass
 class _VolumeTransition:
@@ -173,7 +163,7 @@ def _interpolateVolume(startVolume: float, targetVolume: float, progress: float)
 class FocusAwareSessionDucker:
 	def __init__(
 		self,
-		duckingConfig: AudioDuckingConfig = DEFAULT_DUCKING_CONFIG,
+		duckingConfig: AudioDuckingConfig = FALLBACK_DUCKING_CONFIG,
 		recoveryPath: Optional[str] = None,
 		callLater=None,
 	):
@@ -189,7 +179,7 @@ class FocusAwareSessionDucker:
 		self._resolver = _ApplicationResolver()
 		self._applicationVolumes: Dict[str, float] = {}
 		self._trackedSessions: Dict[Tuple[int, str], AudioSessionVolume] = {}
-		self._config = DEFAULT_DUCKING_CONFIG
+		self._config = FALLBACK_DUCKING_CONFIG
 		self._originalVolumes: Dict[Tuple[int, str], float] = {}
 		self._desiredDucked: Dict[Tuple[int, str], bool] = {}
 		self._appliedDepths: Dict[Tuple[int, str], float] = {}
@@ -239,22 +229,28 @@ class FocusAwareSessionDucker:
 			return
 		try:
 			currentSessions = {session.key: session for session in iterAudioSessions(keys)}
+			livePids = getLivePids()
 		except Exception:
 			log.exception("Enhanced Duck: could not inspect sessions for crash recovery")
 			return
-		restoredKeys = []
+		discardableKeys = []
 		for key in keys:
 			session = currentSessions.get(key)
 			originalVolume = self._recoveryStore.get(key)
 			if session is None or originalVolume is None:
+				# Windows never reuses a session instance id, so an entry whose
+				# process has exited can never be matched again. An empty pid set
+				# means the snapshot failed, so prune nothing rather than guess.
+				if livePids and key[0] not in livePids:
+					discardableKeys.append(key)
 				continue
 			try:
 				session.setVolume(originalVolume)
 			except Exception:
 				log.exception("Enhanced Duck: could not recover an application volume")
 			else:
-				restoredKeys.append(key)
-		self._discardRecoveryEntries(restoredKeys)
+				discardableKeys.append(key)
+		self._discardRecoveryEntries(discardableKeys)
 
 	def start(self, mode: int):
 		if mode not in (DUCK_INACTIVE_WINDOWS, DUCK_ACTIVE_WINDOWS, DUCK_ALL_APPLICATIONS):
@@ -456,7 +452,9 @@ class FocusAwareSessionDucker:
 				self._restoreSession(session)
 			except Exception:
 				log.debugWarning("Enhanced Duck: session disappeared before restoration", exc_info=True)
-				self._forgetSession(staleKey)
+				# Gone from the enumeration, so its ledger entry can never match
+				# again; discard it instead of keeping it for the backstop age.
+				self._forgetSession(staleKey, restored=True)
 
 		liveApps = set()
 		for session in sorted(sessions, key=lambda session: session.state == AUDIO_SESSION_STATE_ACTIVE):
@@ -513,9 +511,13 @@ class FocusAwareSessionDucker:
 			self._originalVolumes[key] = originalVolume
 			self._applicationVolumes[session.appKey] = originalVolume
 		self._cancelPendingRecoveryDiscard(key)
+		inFlight = self._transitions.get(key)
 		needsNewTarget = (
 			not self._desiredDucked.get(key, False)
 			or self._appliedDepths.get(key) != self._config.depth
+			# A release re-armed by configure() or by a failed transition leaves
+			# both of those unchanged, but the fade still has to turn around.
+			or (inFlight is not None and inFlight.restoreWhenComplete)
 		)
 		if not needsNewTarget:
 			return

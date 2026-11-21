@@ -16,7 +16,9 @@ from typing import Dict, Iterable, Optional, Tuple
 
 RecoveryKey = Tuple[int, str]
 RECOVERY_FILE_VERSION = 1
-DEFAULT_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
+# Entries are pruned by process liveness; this is only a backstop for a
+# ledger left behind by a machine that never came back up.
+DEFAULT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -132,4 +134,6 @@ class VolumeRecoveryStore:
 		with open(temporaryPath, "w", encoding="utf-8") as recoveryFile:
 			json.dump(payload, recoveryFile, ensure_ascii=False, separators=(",", ":"))
 			recoveryFile.flush()
+			# This file only earns its keep after an unclean exit, so reach the disk.
+			os.fsync(recoveryFile.fileno())
 		os.replace(temporaryPath, self._path)

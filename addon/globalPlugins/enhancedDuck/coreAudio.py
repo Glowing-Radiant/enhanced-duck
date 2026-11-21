@@ -300,6 +300,11 @@ def _getParentPidMap() -> Dict[int, int]:
 	return result
 
 
+def getLivePids() -> Set[int]:
+	"""Return every running pid, or an empty set when the snapshot failed."""
+	return set(_getParentPidMap())
+
+
 def _getTopLevelWindowPids() -> Tuple[Set[int], Set[int]]:
 	"""Return ``(visible, any)`` sets of pids owning top-level windows.
 
