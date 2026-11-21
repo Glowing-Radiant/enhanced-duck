@@ -133,10 +133,19 @@ audible; try a longer attack or release time if that happens.
 
 Before reducing an application's session volume, Enhanced Duck saves its
 original value in a small recovery file inside the NVDA configuration folder.
-The entry is removed after restoration. If NVDA or the add-on stops unexpectedly,
-the next start restores any matching sessions before ducking begins again. A
-normal exit or restart also restores volumes without briefly re-enabling NVDA's
-system-wide native ducking effect.
+The entry is removed after restoration, and entries whose application has since
+exited are discarded. If NVDA or the add-on stops unexpectedly, the next start
+restores any matching sessions before ducking begins again. A normal exit or
+restart also restores volumes without briefly re-enabling NVDA's system-wide
+native ducking effect.
+
+Windows remembers each application's volume-mixer level across runs, so this
+recovery file is what keeps an unclean exit from leaving applications quiet. It
+can only match sessions that are still open: if the machine is restarted, or an
+application is closed and reopened, before NVDA runs again, that application
+keeps its lowered mixer level and has to be turned back up by hand. This applies
+to every ducking mode except **No ducking**, including **Duck when outputting
+speech and sounds**.
 
 ## Building
 

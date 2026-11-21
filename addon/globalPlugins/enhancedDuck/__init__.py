@@ -47,6 +47,7 @@ from .sessionDucker import (
 	DUCK_ALL_APPLICATIONS,
 	DUCK_INACTIVE_WINDOWS,
 	MAX_TRANSITION_TIME_MS,
+	MIN_DEPTH_ADJUSTMENT_STEP,
 )
 from .audioWorker import AudioWorkerSessionDucker
 from .modeSettings import (
@@ -85,6 +86,7 @@ CONFIGURABLE_BUILT_IN_MODES = frozenset({
 	int(audioDucking.AudioDuckingMode.ALWAYS),
 })
 MODE_COUNT = len(MODE_LABELS)
+
 
 def _isAudioDuckingSuspended():
 	check = getattr(audioDucking, "_isAudioDuckingSuspended", None)
@@ -244,19 +246,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				settings = _readDuckingConfig()
 				steps = _readAdjustmentSteps()
 				helper = guiHelper.BoxSizerHelper(panel, sizer=settingsSizer)
+				# Spin controls throughout: a screen reader user can arrow through
+				# the range and hear each value, without having to type a decimal.
 				# Translators: A multiplier from 0.00 to 1.00 for ducked application volume.
 				panel.depthControl = helper.addLabeledControl(
 					_("Ducking volume &multiplier (0.00 to 1.00):"),
-					# NVDA 2026.1's guiHelper only supports a fixed set of labeled
-					# controls and does not include SpinCtrlDouble. TextCtrl provides
-					# the same scalar representation and is associated accessibly.
-					wx.TextCtrl,
-					value=f"{settings.depth:.2f}",
+					wx.SpinCtrlDouble,
+					min=0.0,
+					max=1.0,
+					inc=0.01,
+					initial=settings.depth,
 				)
+				panel.depthControl.SetDigits(2)
 				# Translators: How long the volume reduction transition takes, in milliseconds.
 				panel.attackTimeControl = helper.addLabeledControl(
 					_("&Attack time (milliseconds):"),
-					wx.SpinCtrl,
+					nvdaControls.SelectOnFocusSpinCtrl,
 					min=0,
 					max=MAX_TRANSITION_TIME_MS,
 					initial=settings.attackTimeMs,
@@ -264,7 +269,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				# Translators: How long the volume restoration transition takes, in milliseconds.
 				panel.releaseTimeControl = helper.addLabeledControl(
 					_("&Release time (milliseconds):"),
-					wx.SpinCtrl,
+					nvdaControls.SelectOnFocusSpinCtrl,
 					min=0,
 					max=MAX_TRANSITION_TIME_MS,
 					initial=settings.releaseTimeMs,
@@ -272,21 +277,25 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				# Translators: Step used by NVDA+minus and NVDA+equals to adjust ducking volume.
 				panel.depthAdjustmentStepControl = helper.addLabeledControl(
 					_("Ducking volume adjustment &step (0.0001 to 1.0000):"),
-					wx.TextCtrl,
-					value=f"{steps.depth:.4g}",
+					wx.SpinCtrlDouble,
+					min=MIN_DEPTH_ADJUSTMENT_STEP,
+					max=1.0,
+					inc=0.01,
+					initial=steps.depth,
 				)
+				panel.depthAdjustmentStepControl.SetDigits(4)
 				# Translators: Step used by NVDA+Control+minus or equals to adjust attack time.
 				panel.attackAdjustmentStepControl = helper.addLabeledControl(
 					_("Attack adjustment ste&p (milliseconds):"),
-					wx.SpinCtrl,
+					nvdaControls.SelectOnFocusSpinCtrl,
 					min=1,
 					max=MAX_TRANSITION_TIME_MS,
 					initial=steps.attackTimeMs,
 				)
-				# Translators: Step used by NVDA+Shift+minus or equals to adjust release time.
+				# Translators: Step used by NVDA+Alt+minus or equals to adjust release time.
 				panel.releaseAdjustmentStepControl = helper.addLabeledControl(
 					_("Release adjustment step (m&illiseconds):"),
-					wx.SpinCtrl,
+					nvdaControls.SelectOnFocusSpinCtrl,
 					min=1,
 					max=MAX_TRANSITION_TIME_MS,
 					initial=steps.releaseTimeMs,
@@ -328,7 +337,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 						_("Ducking volume multiplier"),
 					)
 					panel.depthControl.SetFocus()
-					panel.depthControl.SelectAll()
 					return False
 				if panel._getEnteredAdjustmentSteps() is None:
 					panel._showValidationError(
@@ -338,7 +346,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 						_("Keyboard adjustment steps"),
 					)
 					panel.depthAdjustmentStepControl.SetFocus()
-					panel.depthAdjustmentStepControl.SelectAll()
 					return False
 				if not panel.cycleModesList.GetCheckedItems():
 					panel._showValidationError(

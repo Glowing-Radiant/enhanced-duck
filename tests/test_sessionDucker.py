@@ -217,6 +217,83 @@ class VolumeTransitionTests(unittest.TestCase):
 		finally:
 			sessionDucker.time.monotonic = originalMonotonic
 
+	def test_release_time_change_does_not_block_a_reduck_mid_fade(self):
+		ducker = sessionDucker.FocusAwareSessionDucker(
+			sessionDucker.AudioDuckingConfig(0.25, 100, 1000),
+		)
+		ducker._mode = sessionDucker.DUCK_ALL_APPLICATIONS
+		session = _FakeSession(0.8)
+		with patch.object(sessionDucker, "iterAudioSessions", return_value=[session]):
+			ducker._updateDuckedSessions(0.0)
+			ducker._updateDuckedSessions(0.2)
+			self.assertAlmostEqual(session.value, 0.2)
+			# Output ends, so a release fade starts.
+			ducker._mode = None
+			ducker._updateDuckedSessions(0.3)
+			ducker._updateDuckedSessions(0.5)
+			# NVDA+alt+equals during that fade changes the release time only,
+			# which must not strand the session on its way back to full volume.
+			ducker.configure(sessionDucker.AudioDuckingConfig(0.25, 100, 1500))
+			ducker._mode = sessionDucker.DUCK_ALL_APPLICATIONS
+			ducker._updateDuckedSessions(0.55)
+			transition = ducker._transitions[session.key]
+			self.assertFalse(transition.restoreWhenComplete)
+			self.assertAlmostEqual(transition.targetVolume, 0.2)
+			ducker._updateDuckedSessions(2.5)
+			self.assertAlmostEqual(session.value, 0.2)
+
+	def test_recovery_entries_for_dead_processes_are_discarded(self):
+		with tempfile.TemporaryDirectory() as directory:
+			path = f"{directory}/recovery.json"
+			store = sessionDucker.VolumeRecoveryStore(path)
+			store.record((4242, "gone"), 0.9)
+			store.record((4243, "still-running"), 0.7)
+			ducker = sessionDucker.FocusAwareSessionDucker(recoveryPath=path)
+			with patch.object(sessionDucker, "iterAudioSessions", return_value=[]):
+				with patch.object(sessionDucker, "getLivePids", return_value={4243}):
+					ducker.recoverStaleVolumes()
+			self.assertEqual(
+				set(sessionDucker.VolumeRecoveryStore(path).keys()),
+				{(4243, "still-running")},
+			)
+
+	def test_a_failed_snapshot_prunes_no_recovery_entries(self):
+		with tempfile.TemporaryDirectory() as directory:
+			path = f"{directory}/recovery.json"
+			sessionDucker.VolumeRecoveryStore(path).record((4242, "unknown"), 0.9)
+			ducker = sessionDucker.FocusAwareSessionDucker(recoveryPath=path)
+			with patch.object(sessionDucker, "iterAudioSessions", return_value=[]):
+				with patch.object(sessionDucker, "getLivePids", return_value=set()):
+					ducker.recoverStaleVolumes()
+			self.assertEqual(
+				set(sessionDucker.VolumeRecoveryStore(path).keys()),
+				{(4242, "unknown")},
+			)
+
+	def test_vanished_session_does_not_leave_a_recovery_entry(self):
+		class VanishingSession(_FakeSession):
+			def setVolume(self, value):
+				raise OSError("audio session expired")
+
+		with tempfile.TemporaryDirectory() as directory:
+			path = f"{directory}/recovery.json"
+			ducker = sessionDucker.FocusAwareSessionDucker(
+				sessionDucker.AudioDuckingConfig(0.25, 0, 0),
+				recoveryPath=path,
+			)
+			ducker._mode = sessionDucker.DUCK_ALL_APPLICATIONS
+			session = _FakeSession(0.8)
+			with patch.object(sessionDucker, "iterAudioSessions", return_value=[session]):
+				ducker._updateDuckedSessions(0.0)
+			self.assertIn(session.key, ducker._recoveryStore.keys())
+			# The process exits, so the tracked session both disappears from the
+			# enumeration and can no longer be written to.
+			ducker._trackedSessions[session.key] = VanishingSession(0.2)
+			with patch.object(sessionDucker, "iterAudioSessions", return_value=[]):
+				ducker._updateDuckedSessions(0.1)
+			ducker._flushPendingRecoveryDiscards()
+			self.assertEqual(set(ducker._recoveryStore.keys()), set())
+
 	def test_ramps_use_five_millisecond_ticks(self):
 		self.assertEqual(sessionDucker.RAMP_INTERVAL_MS, 5)
 

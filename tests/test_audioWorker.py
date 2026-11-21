@@ -117,7 +117,7 @@ class AudioWorkerTests(unittest.TestCase):
 				engine.events.put(("scheduled", threading.get_ident()))
 
 		worker = audioWorker.AudioWorkerSessionDucker(
-			sessionDucker.DEFAULT_DUCKING_CONFIG,
+			sessionDucker.FALLBACK_DUCKING_CONFIG,
 			engineFactory=lambda config, path, callLater: CancellingEngine(
 				self.events, config, path, callLater,
 			),
@@ -143,7 +143,7 @@ class AudioWorkerTests(unittest.TestCase):
 				super().recoverStaleVolumes()
 
 		worker = audioWorker.AudioWorkerSessionDucker(
-			sessionDucker.DEFAULT_DUCKING_CONFIG,
+			sessionDucker.FALLBACK_DUCKING_CONFIG,
 			engineFactory=lambda config, path, callLater: SlowRecoveryEngine(
 				self.events, config, path, callLater,
 			),
@@ -167,7 +167,7 @@ class AudioWorkerTests(unittest.TestCase):
 			raise RuntimeError("COM unavailable")
 
 		worker = audioWorker.AudioWorkerSessionDucker(
-			sessionDucker.DEFAULT_DUCKING_CONFIG,
+			sessionDucker.FALLBACK_DUCKING_CONFIG,
 			initializeCom=failCom,
 			uninitializeCom=lambda: None,
 		)
