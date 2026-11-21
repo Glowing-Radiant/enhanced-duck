@@ -237,6 +237,27 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			log.exception("Enhanced Duck: could not load the settings panel")
 			return
 
+		def addLabeledSpinCtrlDouble(panel, helper, labelText, **kwargs):
+			"""Lay out a label and a ``wx.SpinCtrlDouble`` inside ``helper``.
+
+			``guiHelper.addLabeledControl`` cannot build this pair.
+			``guiHelper.associateElements`` dispatches on a fixed set of wx control
+			types, and ``wx.SpinCtrlDouble`` is a sibling of ``wx.SpinCtrl`` rather
+			than a subclass, so it matches no branch, leaves its ``sizer`` local
+			unassigned and raises ``UnboundLocalError``. That aborts the whole panel,
+			which in turn leaves NVDA's settings dialog half-built and unopenable.
+			This mirrors the horizontal layout NVDA itself uses for a label and its
+			associated control.
+			"""
+			label = wx.StaticText(panel, label=labelText)
+			control = wx.SpinCtrlDouble(panel, **kwargs)
+			sizer = wx.BoxSizer(wx.HORIZONTAL)
+			sizer.Add(label, flag=wx.ALIGN_CENTER_VERTICAL)
+			sizer.AddSpacer(guiHelper.SPACE_BETWEEN_ASSOCIATED_CONTROL_HORIZONTAL)
+			sizer.Add(control)
+			helper.addItem(sizer)
+			return control
+
 		class EnhancedDuckSettingsPanel(settingsDialogs.SettingsPanel):
 			# Translators: The title of the Enhanced Duck settings category.
 			title = _("Enhanced Duck")
@@ -249,9 +270,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				# Spin controls throughout: a screen reader user can arrow through
 				# the range and hear each value, without having to type a decimal.
 				# Translators: A multiplier from 0.00 to 1.00 for ducked application volume.
-				panel.depthControl = helper.addLabeledControl(
+				panel.depthControl = addLabeledSpinCtrlDouble(
+					panel,
+					helper,
 					_("Ducking volume &multiplier (0.00 to 1.00):"),
-					wx.SpinCtrlDouble,
 					min=0.0,
 					max=1.0,
 					inc=0.01,
@@ -275,9 +297,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 					initial=settings.releaseTimeMs,
 				)
 				# Translators: Step used by NVDA+minus and NVDA+equals to adjust ducking volume.
-				panel.depthAdjustmentStepControl = helper.addLabeledControl(
+				panel.depthAdjustmentStepControl = addLabeledSpinCtrlDouble(
+					panel,
+					helper,
 					_("Ducking volume adjustment &step (0.0001 to 1.0000):"),
-					wx.SpinCtrlDouble,
 					min=MIN_DEPTH_ADJUSTMENT_STEP,
 					max=1.0,
 					inc=0.01,
